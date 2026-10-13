@@ -1,0 +1,374 @@
+name: AORC AI - Build APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build AORC AI APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Install tools and Android SDK 36
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y unzip python3
+
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -name sdkmanager -print -quit 2>/dev/null || true)"
+
+          if [ -z "$SDKMANAGER" ]; then
+            echo "::error::Android sdkmanager was not found."
+            exit 1
+          fi
+
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          "$SDKMANAGER" --install "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Find or extract Flutter project
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$GITHUB_WORKSPACE"
+
+          if [ -f "$ROOT/pubspec.yaml" ]; then
+            PROJECT_DIR="$ROOT"
+          elif [ -f "$ROOT/aorc_ai/pubspec.yaml" ]; then
+            PROJECT_DIR="$ROOT/aorc_ai"
+          else
+            ZIP_FILE="$(find "$ROOT" -maxdepth 3 -type f -iname '*.zip' -not -path '*/.git/*' -print -quit)"
+
+            if [ -z "$ZIP_FILE" ]; then
+              echo "::error::No Flutter project or ZIP file found."
+              exit 1
+            fi
+
+            mkdir -p "$ROOT/_build_source"
+            unzip -o "$ZIP_FILE" -d "$ROOT/_build_source"
+
+            PUBSPEC="$(find "$ROOT/_build_source" -type f -name pubspec.yaml -not -path '*/.dart_tool/*' -print -quit)"
+
+            if [ -z "$PUBSPEC" ]; then
+              echo "::error::No pubspec.yaml found inside ZIP."
+              exit 1
+            fi
+
+            PROJECT_DIR="$(dirname "$PUBSPEC")"
+          fi
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Flutter project: $PROJECT_DIR"
+          ls -la "$PROJECT_DIR"
+
+      - name: Fix PixelBar import if needed
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          project = Path(os.environ["PROJECT_DIR"])
+          dart_file = project / "lib" / "dictation.dart"
+          progress_file = project / "lib" / "progress.dart"
+
+          if not dart_file.exists():
+              print("dictation.dart not found; skipping.")
+              raise SystemExit(0)
+
+          source = dart_file.read_text(encoding="utf-8")
+
+          if "PixelBar(" in source and "import 'progress.dart';" not in source:
+              if not progress_file.exists() or "class PixelBar" not in progress_file.read_text(encoding="utf-8"):
+                  raise SystemExit("PixelBar is used but was not found in lib/progress.dart.")
+
+              anchor = "import 'common.dart';"
+              if anchor not in source:
+                  raise SystemExit("Cannot safely add the PixelBar import.")
+
+              source = source.replace(anchor, anchor + "\nimport 'progress.dart';", 1)
+              dart_file.write_text(source, encoding="utf-8")
+              print("Added the missing PixelBar import.")
+          else:
+              print("PixelBar import already present or not required.")
+          PY
+
+      - name: Generate Android files if missing
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+
+          if [ ! -f android/gradlew ] || [ ! -f android/gradle/wrapper/gradle-wrapper.properties ]; then
+            flutter create --platforms=android --project-name aorc_ai --org com.aorc .
+          fi
+
+          test -f android/gradlew
+          test -f android/gradle/wrapper/gradle-wrapper.properties
+          test -f android/gradle.properties
+          chmod +x android/gradlew
+
+      - name: Enable Gradle compatibility and set app SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          project = Path(os.environ["PROJECT_DIR"])
+          android = project / "android"
+          props = android / "gradle.properties"
+
+          lines = props.read_text(encoding="utf-8").splitlines() if props.exists() else []
+          lines = [
+              line for line in lines
+              if not line.startswith("android.newDsl=")
+              and not line.startswith("android.builtInKotlin=")
+          ]
+          lines += [
+              "android.newDsl=false",
+              "android.builtInKotlin=false",
+          ]
+          props.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+          print("Enabled Flutter legacy Gradle compatibility.")
+
+          app_files = [
+              android / "app" / "build.gradle.kts",
+              android / "app" / "build.gradle",
+          ]
+          app_file = next((p for p in app_files if p.exists()), None)
+
+          if app_file is None:
+              raise SystemExit("Android app Gradle file was not found.")
+
+          text = app_file.read_text(encoding="utf-8")
+
+          if app_file.name.endswith(".gradle.kts"):
+              pattern = r"(?m)^(\s*)compileSdk\s*=\s*[^\n]+"
+              replacement = r"\g<1>compileSdk = 36"
+          else:
+              pattern = r"(?m)^(\s*)compileSdkVersion\s+[^\n]+|^(\s*)compileSdk\s+[^\n]+"
+              replacement = lambda m: (m.group(1) or m.group(2)) + "compileSdkVersion 36"
+
+          updated, count = re.subn(pattern, replacement, text, count=1)
+
+          if count == 0:
+              match = re.search(r"(?m)^(\s*)android\s*\{", text)
+              if not match:
+                  raise SystemExit("Could not find the app's existing android block.")
+
+              indent = match.group(1) + "    "
+              setting = (
+                  f"\n{indent}compileSdk = 36\n"
+                  if app_file.name.endswith(".gradle.kts")
+                  else f"\n{indent}compileSdkVersion 36\n"
+              )
+              updated = text[:match.end()] + setting + text[match.end():]
+
+          app_file.write_text(updated, encoding="utf-8")
+          print("Updated the existing app Gradle configuration to SDK 36.")
+          PY
+
+      - name: Install Flutter dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          flutter pub get
+
+      - name: Patch app manifest and desugaring
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+
+          if [ -f tools/patch_manifest.py ]; then
+            python3 tools/patch_manifest.py
+          else
+            echo "No custom manifest patch script found; continuing."
+          fi
+
+      - name: Align Android plugin SDK and Kotlin targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          cache = Path(
+              os.environ.get("PUB_CACHE", str(Path.home() / ".pub-cache"))
+          )
+
+          if not cache.exists():
+              raise SystemExit(f"Pub cache not found: {cache}")
+
+          marker = "AORC_CI_ANDROID36_JVM17"
+          patched = []
+          file_picker_found = False
+
+          candidates = (
+              list(cache.rglob("build.gradle"))
+              + list(cache.rglob("build.gradle.kts"))
+          )
+
+          for gradle_file in candidates:
+              if gradle_file.parent.name != "android":
+                  continue
+
+              path_lower = str(gradle_file).lower()
+
+              if "file_picker-" in path_lower:
+                  file_picker_found = True
+
+              try:
+                  source = gradle_file.read_text(encoding="utf-8")
+              except (OSError, UnicodeError):
+                  continue
+
+              if "android {" not in source and "android{" not in source:
+                  continue
+
+              if marker in source:
+                  patched.append(str(gradle_file))
+                  continue
+
+              kotlin_module = "kotlin" in source.lower()
+
+              if gradle_file.name == "build.gradle.kts":
+                  block = f"""
+
+          // {marker}
+          android {{
+              compileSdk = 36
+              compileOptions {{
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }}
+          }}
+          """
+
+                  if kotlin_module:
+                      block += """
+          tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach {
+              compilerOptions.jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+          }
+          """
+              else:
+                  block = f"""
+
+          // {marker}
+          android {{
+              compileSdkVersion 36
+              compileOptions {{
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }}
+          }}
+          """
+
+                  if kotlin_module:
+                      block += """
+          tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile).configureEach {
+              compilerOptions.jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+          }
+          """
+
+              gradle_file.write_text(
+                  source.rstrip() + block + "\n",
+                  encoding="utf-8",
+              )
+              patched.append(str(gradle_file))
+
+          if not file_picker_found:
+              raise SystemExit("Could not find file_picker's Android Gradle file.")
+
+          print(f"Patched or verified {len(patched)} Android plugin Gradle files.")
+          for path in patched:
+              print(f"  {path}")
+          PY
+
+      - name: Remove obsolete template widget test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+
+          if [ -f test/widget_test.dart ] && grep -q "MyApp" test/widget_test.dart; then
+            rm test/widget_test.dart
+            echo "Removed outdated default widget test."
+          fi
+
+      - name: Generate launcher icons
+        shell: bash
+        continue-on-error: true
+        run: |
+          cd "$PROJECT_DIR"
+          dart run flutter_launcher_icons
+
+      - name: Analyze Dart code
+        shell: bash
+        continue-on-error: true
+        run: |
+          cd "$PROJECT_DIR"
+          flutter analyze --no-pub --no-fatal-infos --no-fatal-warnings
+
+      - name: Build release APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          flutter build apk --release
+
+      - name: Verify APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="$PROJECT_DIR/build/app/outputs/flutter-apk/app-release.apk"
+
+          if [ ! -s "$APK" ]; then
+            echo "::error::APK was not generated."
+            exit 1
+          fi
+
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          cp "$APK" "$GITHUB_WORKSPACE/dist/aorc-ai.apk"
+
+          ls -lh "$GITHUB_WORKSPACE/dist/aorc-ai.apk"
+          sha256sum "$GITHUB_WORKSPACE/dist/aorc-ai.apk"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AORC-AI-APK
+          path: dist/aorc-ai.apk
+          if-no-files-found: error
+          retention-days: 14
