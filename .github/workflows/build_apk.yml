@@ -1,0 +1,138 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Show versions
+        run: flutter --version
+
+      - name: Generate Android scaffold
+        run: |
+          flutter create . --platforms=android --project-name aorc_ai --org com.aorc
+          rm -rf test
+
+      # Fixes "Expected ':' before this" in lib/services/ai_service.dart.
+      # Does nothing if the file or the line does not exist.
+      - name: Fix ai_service.dart parsing error
+        run: |
+          python3 - <<'PY'
+          import os, re
+          p = "lib/services/ai_service.dart"
+          if os.path.exists(p):
+              s = open(p, encoding="utf-8").read()
+              new = ("final dynamic content = ((data as dynamic) is Map && (data as dynamic)['choices'] is List && "
+                     "((data as dynamic)['choices'] as List).isNotEmpty) ? "
+                     "((data as dynamic)['choices'] as List)[0]['message']['content'] : null;")
+              s2 = re.sub(r"^[ \t]*final content = data is Map.*$", "    " + new, s, flags=re.M)
+              if s2 != s:
+                  open(p, "w", encoding="utf-8").write(s2)
+                  print("patched", p)
+              else:
+                  print("pattern not found in", p)
+          else:
+              print("no", p)
+          PY
+
+      - name: Install packages
+        run: flutter pub get
+
+      - name: Patch Android manifest and gradle
+        run: |
+          python3 - <<'PY'
+          import glob, re, sys
+
+          PATH = "android/app/src/main/AndroidManifest.xml"
+          xml = open(PATH, encoding="utf-8").read()
+
+          perms = [
+              "android.permission.INTERNET",
+              "android.permission.RECORD_AUDIO",
+              "android.permission.POST_NOTIFICATIONS",
+              "android.permission.RECEIVE_BOOT_COMPLETED",
+              "android.permission.VIBRATE",
+          ]
+          for p in perms:
+              if p not in xml:
+                  xml = re.sub(r"(<manifest[^>]*>)",
+                               r'\1\n    <uses-permission android:name="%s"/>' % p,
+                               xml, count=1)
+
+          q_items = [
+              ("TTS_SERVICE", '<intent><action android:name="android.intent.action.TTS_SERVICE"/></intent>'),
+              ("RecognitionService", '<intent><action android:name="android.speech.RecognitionService"/></intent>'),
+          ]
+          for key, item in q_items:
+              if key not in xml:
+                  if "<queries>" in xml:
+                      xml = xml.replace("<queries>", "<queries>\n        " + item, 1)
+                  else:
+                      xml = xml.replace("<application",
+                                        "<queries>\n        " + item + "\n    </queries>\n    <application", 1)
+
+          receivers = """
+                  <receiver android:exported="false" android:name="com.dexterous.flutterlocalnotifications.ScheduledNotificationReceiver" />
+                  <receiver android:exported="false" android:name="com.dexterous.flutterlocalnotifications.ScheduledNotificationBootReceiver">
+                      <intent-filter>
+                          <action android:name="android.intent.action.BOOT_COMPLETED"/>
+                          <action android:name="android.intent.action.MY_PACKAGE_REPLACED"/>
+                          <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                          <action android:name="com.htc.intent.action.QUICKBOOT_POWERON"/>
+                      </intent-filter>
+                  </receiver>
+          """
+          if "ScheduledNotificationReceiver" not in xml:
+              xml = xml.replace("</application>", receivers + "    </application>", 1)
+
+          xml = re.sub(r'android:label="[^"]*"', 'android:label="aorc ai"', xml, count=1)
+          open(PATH, "w", encoding="utf-8").write(xml)
+          print("Manifest patched")
+
+          files = glob.glob("android/app/build.gradle.kts") + glob.glob("android/app/build.gradle")
+          if not files:
+              print("WARNING: no app build.gradle found")
+              sys.exit(0)
+          g = files[0]
+          src = open(g, encoding="utf-8").read()
+          if "coreLibraryDesugaring" not in src:
+              if g.endswith(".kts"):
+                  src = re.sub(r"(compileOptions\s*\{)",
+                               r"\1\n        isCoreLibraryDesugaringEnabled = true", src, count=1)
+                  src += '\ndependencies {\n    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.0.4")\n}\n'
+              else:
+                  src = re.sub(r"(compileOptions\s*\{)",
+                               r"\1\n        coreLibraryDesugaringEnabled true", src, count=1)
+                  src += "\ndependencies {\n    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.0.4'\n}\n"
+              open(g, "w", encoding="utf-8").write(src)
+          print("Gradle patched:", g)
+          PY
+
+      - name: Generate launcher icons
+        continue-on-error: true
+        run: dart run flutter_launcher_icons
+
+      - name: Build release APK
+        run: flutter build apk --release
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: aorc-ai-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
