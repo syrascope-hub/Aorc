@@ -1,0 +1,223 @@
+name: AORC AI - Build APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Extract, Fix and Build APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      # 1. Download repository
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. Install Java for Android builds
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # 3. Install Flutter
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      # 4. Find and extract the Flutter project
+      - name: Extract ZIP and locate project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -f "$GITHUB_WORKSPACE/pubspec.yaml" ]; then
+            PROJECT_DIR="$GITHUB_WORKSPACE"
+          else
+            ZIP_FILE="$(find "$GITHUB_WORKSPACE" \
+              -maxdepth 3 -type f -iname '*.zip' \
+              -not -path '*/.git/*' -print -quit)"
+
+            if [ -z "$ZIP_FILE" ]; then
+              echo "::error::No ZIP file or Flutter project found."
+              exit 1
+            fi
+
+            mkdir -p "$GITHUB_WORKSPACE/_build_source"
+            unzip -o "$ZIP_FILE" \
+              -d "$GITHUB_WORKSPACE/_build_source"
+
+            PUBSPEC="$(find "$GITHUB_WORKSPACE/_build_source" \
+              -type f -name pubspec.yaml -print -quit)"
+
+            if [ -z "$PUBSPEC" ]; then
+              echo "::error::ZIP contains no Flutter pubspec.yaml."
+              exit 1
+            fi
+
+            PROJECT_DIR="$(dirname "$PUBSPEC")"
+          fi
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Project: $PROJECT_DIR"
+          ls -la "$PROJECT_DIR"
+
+      # 5. Fix the missing PixelBar import
+      - name: Fix Dart source imports
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          project = Path(os.environ["PROJECT_DIR"])
+          dart_file = project / "lib" / "dictation.dart"
+
+          if not dart_file.exists():
+              raise SystemExit("lib/dictation.dart was not found")
+
+          source = dart_file.read_text(encoding="utf-8")
+
+          if "PixelBar(" in source and \
+             "import 'progress.dart';" not in source:
+
+              if "import 'common.dart';" not in source:
+                  raise SystemExit(
+                      "Cannot safely add progress.dart import"
+                  )
+
+              source = source.replace(
+                  "import 'common.dart';",
+                  "import 'common.dart';\nimport 'progress.dart';",
+                  1,
+              )
+
+              dart_file.write_text(source, encoding="utf-8")
+              print("Added missing PixelBar import.")
+          else:
+              print("PixelBar import is already present.")
+          PY
+
+      # 6. Generate Android Gradle files if missing
+      - name: Prepare Android project
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+
+          if [ ! -f android/gradlew ] || \
+             [ ! -f android/gradle/wrapper/gradle-wrapper.properties ]; then
+
+            flutter create \
+              --platforms=android \
+              --org com.aorc \
+              --project-name aorc_ai \
+              .
+
+          fi
+
+          if [ ! -f android/gradlew ] || \
+             [ ! -f android/gradle/wrapper/gradle-wrapper.properties ]; then
+            echo "::error::Android Gradle wrapper is missing."
+            exit 1
+          fi
+
+          chmod +x android/gradlew
+
+      # 7. Remove only the default test that refers to MyApp
+      - name: Remove stale template test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+
+          if [ -f test/widget_test.dart ] && \
+             grep -q 'MyApp' test/widget_test.dart; then
+            rm -f test/widget_test.dart
+            echo "Removed outdated default widget test."
+          fi
+
+      # 8. Install Flutter dependencies
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          flutter pub get
+
+      # 9. Patch Android manifest and desugaring
+      - name: Patch Android configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+
+          if [ -f tools/patch_manifest.py ]; then
+            python3 tools/patch_manifest.py
+          else
+            echo "No custom Android patch script; skipping."
+          fi
+
+      # 10. Generate launcher icon
+      - name: Generate launcher icon
+        shell: bash
+        continue-on-error: true
+        run: |
+          cd "$PROJECT_DIR"
+          dart run flutter_launcher_icons
+
+      # 11. Analyze code without blocking the actual build
+      - name: Analyze Dart code
+        shell: bash
+        continue-on-error: true
+        run: |
+          cd "$PROJECT_DIR"
+          flutter analyze --no-pub \
+            --no-fatal-infos \
+            --no-fatal-warnings
+
+      # 12. Build APK
+      - name: Build release APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+
+          flutter build apk --release
+
+      # 13. Verify generated APK
+      - name: Verify APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK="$PROJECT_DIR/build/app/outputs/flutter-apk/app-release.apk"
+
+          if [ ! -s "$APK" ]; then
+            echo "::error::APK was not generated."
+            exit 1
+          fi
+
+          ls -lh "$APK"
+          sha256sum "$APK"
+
+      # 14. Upload APK to GitHub Actions
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: AORC-AI-APK
+          path: ${{ env.PROJECT_DIR }}/build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
+          retention-days: 14
