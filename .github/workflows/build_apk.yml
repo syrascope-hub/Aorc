@@ -1,0 +1,148 @@
+name: Build AORC AI APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install unzip
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip
+
+      - name: Extract ZIP and locate Flutter project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ZIP_FILE="aorc_ai_v2.zip"
+
+          if [ ! -f "$ZIP_FILE" ]; then
+            echo "::error::Missing $ZIP_FILE in repository root."
+            echo "Available ZIP files:"
+            find . -type f -iname '*.zip' -print
+            exit 1
+          fi
+
+          mkdir -p extracted
+          unzip -o "$ZIP_FILE" -d extracted
+
+          PUBSPEC="$(find extracted -type f \
+            -name pubspec.yaml \
+            -not -path '*/.dart_tool/*' \
+            -print -quit)"
+
+          if [ -z "$PUBSPEC" ]; then
+            echo "::error::No pubspec.yaml found. This ZIP may not contain a Flutter project."
+            exit 1
+          fi
+
+          PROJECT_DIR="$(dirname "$PUBSPEC")"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+          echo "Flutter project found at: $PROJECT_DIR"
+          ls -la "$PROJECT_DIR"
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Check Flutter installation
+        run: |
+          flutter --version
+          dart --version
+          flutter doctor -v
+
+      - name: Repair missing Android Gradle wrapper
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+
+          if [ ! -f android/gradlew ] || \
+             [ ! -f android/gradle/wrapper/gradle-wrapper.properties ]; then
+            echo "Android Gradle wrapper is missing."
+            echo "Generating Android platform files."
+
+            flutter create \
+              --platforms=android \
+              --org com.aorc \
+              --project-name aorc_ai \
+              .
+          fi
+
+          if [ ! -f android/gradle/wrapper/gradle-wrapper.properties ]; then
+            echo "::error::Gradle wrapper generation failed."
+            exit 1
+          fi
+
+          if [ ! -f android/gradlew ]; then
+            echo "::error::Gradle launcher is missing."
+            exit 1
+          fi
+
+          chmod +x android/gradlew
+
+      - name: Get Flutter dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          flutter pub get
+
+      - name: Validate Flutter project
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          flutter analyze --no-pub
+
+      - name: Build release APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          flutter build apk --release
+
+      - name: Verify APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="$PROJECT_DIR/build/app/outputs/flutter-apk/app-release.apk"
+
+          if [ ! -s "$APK" ]; then
+            echo "::error::APK was not generated."
+            exit 1
+          fi
+
+          ls -lh "$APK"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AORC-AI-Android-APK
+          path: ${{ env.PROJECT_DIR }}/build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
+          retention-days: 14
