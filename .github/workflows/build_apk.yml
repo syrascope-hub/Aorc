@@ -1,4 +1,4 @@
-name: AORC AI - Build APK
+name: AORC AI - Build APK v19 (Tokyo Night design)
 
 on:
   workflow_dispatch:
@@ -125,6 +125,36 @@ jobs:
               print("PixelBar import already present or not required.")
           PY
 
+      - name: Verify Tokyo Night design
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          python3 - <<'PYEOF'
+          from pathlib import Path
+          lib = Path("lib")
+          checks = {
+              "Tokyo Night palette": ("theme.dart", "'tokyo'"),
+              "Tokyo Night state": ("state.dart", "TOKYO_NIGHT_DESIGN"),
+              "Tokyo Night background painter": ("backgrounds.dart", "void _izakaya"),
+              "Tokyo Night background registration": ("backgrounds.dart", "BgDef('izakaya'"),
+              "Tokyo Night scene switch": ("backgrounds.dart", "case 'izakaya':"),
+          }
+          errors = []
+          for label, (filename, marker) in checks.items():
+              path = lib / filename
+              if not path.is_file():
+                  errors.append(f"Missing required file: {path}")
+                  continue
+              if marker not in path.read_text(encoding="utf-8"):
+                  errors.append(f"{label} is missing marker: {marker}")
+          if errors:
+              for error in errors:
+                  print(f"::error::{error}")
+              raise SystemExit(1)
+          print("Tokyo Night design verified; no source rewrite needed.")
+          PYEOF
+
       - name: Generate Android files if missing
         shell: bash
         run: |
@@ -217,11 +247,17 @@ jobs:
           set -euo pipefail
           cd "$PROJECT_DIR"
 
-          if [ -f tools/patch_manifest.py ]; then
-            python3 tools/patch_manifest.py
-          else
-            echo "No custom manifest patch script found; continuing."
-          fi
+          # Required: adds INTERNET, TTS_SERVICE/RecognitionService queries (device voice)
+          # and notification receivers. Without it the speech engines cannot work.
+          test -f tools/patch_manifest.py
+          python3 tools/patch_manifest.py
+
+      - name: Verify speech engines are wired
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          python3 tools/check_engines.py
 
       - name: Align Android plugin SDK and Kotlin targets
         shell: bash
@@ -355,7 +391,7 @@ jobs:
         run: |
           set -euo pipefail
           cd "$PROJECT_DIR"
-          flutter build apk --release
+          flutter build apk --release --build-number=19
 
       # Copies the APK to dist/ and prints its size and SHA-256 checksum.
       - name: Verify APK
