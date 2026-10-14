@@ -36,8 +36,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y unzip python3
 
           SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
           SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -name sdkmanager -print -quit 2>/dev/null || true)"
@@ -50,6 +48,13 @@ jobs:
           yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
           "$SDKMANAGER" --install "platforms;android-36" "build-tools;36.0.0"
 
+      - name: Show tool versions
+        shell: bash
+        run: |
+          flutter --version
+          java -version
+          python3 --version
+
       - name: Find or extract Flutter project
         shell: bash
         run: |
@@ -61,7 +66,8 @@ jobs:
           elif [ -f "$ROOT/aorc_ai/pubspec.yaml" ]; then
             PROJECT_DIR="$ROOT/aorc_ai"
           else
-            ZIP_FILE="$(find "$ROOT" -maxdepth 3 -type f -iname '*.zip' -not -path '*/.git/*' -print -quit)"
+            # Pick the highest-numbered ZIP (e.g. aorc_ai_v9.zip beats aorc_ai_v4.zip).
+            ZIP_FILE="$(find "$ROOT" -maxdepth 3 -type f -iname '*.zip' -not -path '*/.git/*' | sort -V | tail -n 1)"
 
             if [ -z "$ZIP_FILE" ]; then
               echo "::error::No Flutter project or ZIP file found."
@@ -83,6 +89,7 @@ jobs:
 
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
           echo "Flutter project: $PROJECT_DIR"
+          [ -n "${ZIP_FILE:-}" ] && echo "Built from ZIP: $ZIP_FILE" || true
           ls -la "$PROJECT_DIR"
 
       - name: Fix PixelBar import if needed
@@ -334,6 +341,7 @@ jobs:
           cd "$PROJECT_DIR"
           dart run flutter_launcher_icons
 
+      # Analysis never blocks the build; read its output if the build fails.
       - name: Analyze Dart code
         shell: bash
         continue-on-error: true
@@ -341,6 +349,7 @@ jobs:
           cd "$PROJECT_DIR"
           flutter analyze --no-pub --no-fatal-infos --no-fatal-warnings
 
+      # Release build, signed with the default debug key (installs on any phone).
       - name: Build release APK
         shell: bash
         run: |
@@ -348,6 +357,7 @@ jobs:
           cd "$PROJECT_DIR"
           flutter build apk --release
 
+      # Copies the APK to dist/ and prints its size and SHA-256 checksum.
       - name: Verify APK
         shell: bash
         run: |
