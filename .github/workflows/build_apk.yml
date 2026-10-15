@@ -1,4 +1,4 @@
-name: AORC AI - Build APK v19 (Tokyo Night design)
+name: AORC AI - Build APK
 
 on:
   workflow_dispatch:
@@ -124,36 +124,6 @@ jobs:
           else:
               print("PixelBar import already present or not required.")
           PY
-
-      - name: Verify Tokyo Night design
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$PROJECT_DIR"
-          python3 - <<'PYEOF'
-          from pathlib import Path
-          lib = Path("lib")
-          checks = {
-              "Tokyo Night palette": ("theme.dart", "'tokyo'"),
-              "Tokyo Night state": ("state.dart", "TOKYO_NIGHT_DESIGN"),
-              "Tokyo Night background painter": ("backgrounds.dart", "void _izakaya"),
-              "Tokyo Night background registration": ("backgrounds.dart", "BgDef('izakaya'"),
-              "Tokyo Night scene switch": ("backgrounds.dart", "case 'izakaya':"),
-          }
-          errors = []
-          for label, (filename, marker) in checks.items():
-              path = lib / filename
-              if not path.is_file():
-                  errors.append(f"Missing required file: {path}")
-                  continue
-              if marker not in path.read_text(encoding="utf-8"):
-                  errors.append(f"{label} is missing marker: {marker}")
-          if errors:
-              for error in errors:
-                  print(f"::error::{error}")
-              raise SystemExit(1)
-          print("Tokyo Night design verified; no source rewrite needed.")
-          PYEOF
 
       - name: Generate Android files if missing
         shell: bash
@@ -391,7 +361,7 @@ jobs:
         run: |
           set -euo pipefail
           cd "$PROJECT_DIR"
-          flutter build apk --release --build-number=19
+          flutter build apk --release
 
       # Copies the APK to dist/ and prints its size and SHA-256 checksum.
       - name: Verify APK
