@@ -204,6 +204,15 @@ jobs:
           print("Updated the existing app Gradle configuration to SDK 36.")
           PY
 
+      # Downloads Tajawal (body) and Lalezar (headings) and registers them in pubspec.yaml.
+      # Never blocks the build: without the fonts the app uses the phone's default font.
+      - name: Download fonts
+        shell: bash
+        continue-on-error: true
+        run: |
+          cd "$PROJECT_DIR"
+          python3 tools/setup_fonts.py
+
       - name: Install Flutter dependencies
         shell: bash
         run: |
